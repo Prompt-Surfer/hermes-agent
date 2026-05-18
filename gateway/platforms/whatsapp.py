@@ -189,6 +189,12 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_url,
 )
+from gateway.platforms.whatsapp_identity import (
+    get_reply_context,
+    get_self_identity,
+    identities_overlap,
+    resolve_comparable_identity,
+)
 
 
 def check_whatsapp_requirements() -> bool:
@@ -391,46 +397,43 @@ class WhatsAppAdapter(BasePlatformAdapter):
             logger.info("[%s] Loaded %d WhatsApp mention pattern(s)", self.name, len(compiled))
         return compiled
 
-    @staticmethod
-    def _normalize_whatsapp_id(value: Optional[str]) -> str:
-        if not value:
-            return ""
-        normalized = str(value).strip()
-        if ":" in normalized and "@" in normalized:
-            normalized = normalized.replace(":", "@", 1)
-        return normalized
+    def _bot_identity(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Resolve the bot's canonical identity from a bridge message."""
+        return get_self_identity(data)
 
-    def _bot_ids_from_message(self, data: Dict[str, Any]) -> set[str]:
-        bot_ids = set()
-        for candidate in data.get("botIds") or []:
-            normalized = self._normalize_whatsapp_id(candidate)
-            if normalized:
-                bot_ids.add(normalized)
-        return bot_ids
+    @staticmethod
+    def _bot_bare_ids(bot_identity: Dict[str, Any]) -> set[str]:
+        """Return the "bare" identifiers (digits / E.164 without ``+``) that a
+        human might type after ``@`` to mention the bot in a group."""
+        bare: set[str] = set()
+        for key in ("jid", "lid"):
+            value = bot_identity.get(key)
+            if value:
+                bare.add(value.split("@", 1)[0])
+        e164 = bot_identity.get("e164")
+        if e164:
+            bare.add(e164.lstrip("+"))
+        return {b for b in bare if b}
 
     def _message_is_reply_to_bot(self, data: Dict[str, Any]) -> bool:
-        quoted_participant = self._normalize_whatsapp_id(data.get("quotedParticipant"))
-        if not quoted_participant:
+        reply_ctx = get_reply_context(data)
+        if not reply_ctx:
             return False
-        return quoted_participant in self._bot_ids_from_message(data)
+        return identities_overlap(reply_ctx.get("sender"), self._bot_identity(data))
 
     def _message_mentions_bot(self, data: Dict[str, Any]) -> bool:
-        bot_ids = self._bot_ids_from_message(data)
-        if not bot_ids:
-            return False
-        mentioned_ids = {
-            nid
-            for candidate in (data.get("mentionedIds") or [])
-            if (nid := self._normalize_whatsapp_id(candidate))
-        }
-        if mentioned_ids & bot_ids:
-            return True
+        bot = self._bot_identity(data)
+        for raw_mention in data.get("mentionedIds") or []:
+            mention_identity = resolve_comparable_identity({"jid": raw_mention})
+            if identities_overlap(mention_identity, bot):
+                return True
 
-        body = str(data.get("body") or "")
-        lower_body = body.lower()
-        for bot_id in bot_ids:
-            bare_id = bot_id.split("@", 1)[0].lower()
-            if bare_id and (f"@{bare_id}" in lower_body or bare_id in lower_body):
+        body = str(data.get("body") or "").lower()
+        if not body:
+            return False
+        for bare in self._bot_bare_ids(bot):
+            token = bare.lower()
+            if f"@{token}" in body or token in body:
                 return True
         return False
 
@@ -443,12 +446,9 @@ class WhatsAppAdapter(BasePlatformAdapter):
     def _clean_bot_mention_text(self, text: str, data: Dict[str, Any]) -> str:
         if not text:
             return text
-        bot_ids = self._bot_ids_from_message(data)
         cleaned = text
-        for bot_id in bot_ids:
-            bare_id = bot_id.split("@", 1)[0]
-            if bare_id:
-                cleaned = re.sub(rf"@{re.escape(bare_id)}\b[,:\-]*\s*", "", cleaned)
+        for bare in self._bot_bare_ids(self._bot_identity(data)):
+            cleaned = re.sub(rf"@{re.escape(bare)}\b[,:\-]*\s*", "", cleaned)
         return cleaned.strip() or text
 
     def _should_process_message(self, data: Dict[str, Any]) -> bool:
@@ -474,16 +474,17 @@ class WhatsAppAdapter(BasePlatformAdapter):
         chat_id = str(data.get("chatId") or "")
         if chat_id in self._whatsapp_free_response_chats():
             return True
-        if not self._whatsapp_require_mention():
+        require_mention = self._whatsapp_require_mention()
+        if not require_mention:
             return True
         body = str(data.get("body") or "").strip()
         if body.startswith("/"):
             return True
-        if self._message_is_reply_to_bot(data):
-            return True
-        if self._message_mentions_bot(data):
-            return True
-        return self._message_matches_mention_patterns(data)
+        is_reply = self._message_is_reply_to_bot(data)
+        is_mention = self._message_mentions_bot(data)
+        is_pattern = self._message_matches_mention_patterns(data)
+        result = is_reply or is_mention or is_pattern
+        return result
     
     async def connect(self) -> bool:
         """
